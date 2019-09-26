@@ -246,6 +246,7 @@ options:
     description:
       - Block duration for spot request.
         Ignored if spot_price is not set.  See U(https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/spot-requests.html#fixed-duration-spot-instances)
+        Requires Boto3.
     type: int
     choices:
       - 60
@@ -967,9 +968,49 @@ def enforce_count(module, ec2, vpc):
     return (all_instances, instance_dict_array, changed_instance_ids, changed)
 
 
-def create_instances_boto3(module, ec2, vpc, override_count=None):
+def _validate_group_ids(ec2, group_ids):
     """
-    Creates new instances
+    Check if each security group ID in group_ids really exists
+
+    ec2: authenticated ec2 connection object in boto3
+    group_ids: list of group IDs to check
+
+    Returns:
+        True if all group ids are valid.
+        False otherwise.
+    """
+    groups = ec2.describe_security_groups(
+        GroupIds=group_ids
+    )
+    return len(groups['SecurityGroups']) == len(group_ids)
+
+
+def _find_group_ids_from_names(ec2, vpc_id, group_names):
+    """
+    Find IDs of the given security group specified by names
+
+    ec2: authenticated ec2 connection object in boto3
+    vpc_id: ID of the VPC to find security groups
+    group_names: names of the security groups
+
+    Returns:
+        List of security group IDs
+    """
+    groups = ec2.describe_security_groups(
+        Filters=[{
+            "Name": "group-name",
+            "Value": group_names
+        }]
+    )
+             unmatched = set(group_name).difference(str(grp.name) for grp in grp_details)
+            if len(unmatched) > 0:
+                module.fail_json(msg="The following group names are not valid: %s" % ', '.join(unmatched))
+      return [group['GroupId'] for group in groups['SecurityGroups']]
+
+
+def create_instances_boto3(module, ec2, vpc):
+    """
+    Creates new instances.  Currently supports spot requests only.
 
     module : AnsibleModule object
     ec2: authenticated ec2 connection object in boto3
@@ -981,17 +1022,18 @@ def create_instances_boto3(module, ec2, vpc, override_count=None):
     key_name = module.params.get('key_name')
     id = module.params.get('id')
     group_name = module.params.get('group')
+    if isinstance(group_name, string_types):
+        group_name = [group_name]
     group_id = module.params.get('group_id')
+    if isinstance(network_interfaces, string_types):
+        group_id = [group_id]
     zone = module.params.get('zone')
     instance_type = module.params.get('instance_type')
     tenancy = module.params.get('tenancy')
     spot_price = module.params.get('spot_price')
     spot_type = module.params.get('spot_type')
     image = module.params.get('image')
-    if override_count:
-        count = override_count
-    else:
-        count = module.params.get('count')
+    count = module.params.get('count')
     monitoring = module.params.get('monitoring')
     kernel = module.params.get('kernel')
     ramdisk = module.params.get('ramdisk')
@@ -1010,11 +1052,17 @@ def create_instances_boto3(module, ec2, vpc, override_count=None):
     exact_count = module.params.get('exact_count')
     count_tag = module.params.get('count_tag')
     source_dest_check = module.boolean(module.params.get('source_dest_check'))
-    termination_protection = module.boolean(module.params.get('termination_protection'))
+    termination_protection = module.boolean(
+        module.params.get('termination_protection')
+    )
     network_interfaces = module.params.get('network_interfaces')
+    if isinstance(network_interfaces, string_types):
+        network_interfaces = [network_interfaces]
     spot_launch_group = module.params.get('spot_launch_group')
-    instance_initiated_shutdown_behavior = module.params.get('instance_initiated_shutdown_behavior')
-    block_duration_minutes = int(module.params.get('block_duration_minutes'))
+    instance_initiated_shutdown_behavior = module.params.get(
+        'instance_initiated_shutdown_behavior'
+    )
+    block_duration_minutes = module.params.get('block_duration_minutes')
 
     vpc_id = None
     if vpc_subnet_id:
@@ -1025,242 +1073,150 @@ def create_instances_boto3(module, ec2, vpc, override_count=None):
     else:
         vpc_id = None
 
-    try:
-        # Here we try to lookup the group id from the security group name - if group is set.
-        if group_name:
-            if vpc_id:
-                grp_details = ec2.get_all_security_groups(filters={'vpc_id': vpc_id})
-            else:
-                grp_details = ec2.get_all_security_groups()
-            if isinstance(group_name, string_types):
-                group_name = [group_name]
-            unmatched = set(group_name).difference(str(grp.name) for grp in grp_details)
-            if len(unmatched) > 0:
-                module.fail_json(msg="The following group names are not valid: %s" % ', '.join(unmatched))
-            group_id = [str(grp.id) for grp in grp_details if str(grp.name) in group_name]
-        # Now we try to lookup the group id testing if group exists.
-        elif group_id:
-            # wrap the group_id in a list if it's not one already
-            if isinstance(group_id, string_types):
-                group_id = [group_id]
-            grp_details = ec2.get_all_security_groups(group_ids=group_id)
-            group_name = [grp_item.name for grp_item in grp_details]
-    except boto.exception.NoAuthHandlerFound as e:
-        module.fail_json(msg=str(e))
+    if group_id:
+        _validate_group_ids(group_id)
+    elif group_name:
+        group_id = _find_group_ids_from_names(ec2, vpc_id, group_name)
 
     # Lookup any instances that much our run id.
-
     running_instances = []
     count_remaining = int(count)
-
     if id is not None:
-        filter_dict = {'client-token': id, 'instance-state-name': 'running'}
-        previous_reservations = ec2.get_all_instances(None, filter_dict)
+        previous_reservations = ec2.describe_instances(
+            Filters=[
+                {'Name': 'client-token', 'Values': [id]},
+                {'Name': 'instance-state-name', 'Values': ['running']}
+            ],
+        )
         for res in previous_reservations:
-            for prev_instance in res.instances:
+            for prev_instance in res.Resetations.Instances:
                 running_instances.append(prev_instance)
         count_remaining = count_remaining - len(running_instances)
 
-    # Both min_count and max_count equal count parameter. This means the launch request is explicit (we want count, or fail) in how many instances we want.
-
+    # Both min_count and max_count equal count parameter.
+    # This means the launch request is explicit (we want count, or fail)
+    # in how many instances we want.
     if count_remaining == 0:
-        changed = False
-    else:
-        changed = True
+        return ([], [], False)
+
+    # a volume without device_name is invalid
+    if volumes:
+        for volume in volumes:
+            if 'device_name' not in volume:
+                module.fail_json(msg='Device name must be set for volume')
+
+    # Minimum volume size is 1GiB. We'll use volume size explicitly set to 0
+    # to be a signal not to create this volume
+    volumes = [volume for volume in volumes if volume.volume_size > 0]
+
+    # private_ip is not allowed in this mode
+    private_ip and module.fail_json(
+        msg='private_ip only available with on-demand (non-spot) instances'
+    )
+
+    # Set spot ValidUntil
+    # ValidUntil -> (timestamp). The end date of the request, in
+    # UTC format (for example, YYYY -MM -DD T*HH* :MM :SS Z).
+    now = datetime.datetime.utcnow()
+    utc_valid_until = (now + datetime.timedelta(seconds=spot_wait_timeout))
+
+    launchSpecification = {
+        'BlockDeviceMappings': [
+            {
+                'DeviceName': volume.device_name,
+                'VirtualName': volume.ephemeral,
+                'Ebs': {
+                    'DeleteOnTermination': bool(volume.delete_on_termination),
+                    'Encrypted': bool(volume.encrypted),
+                    'Iops': volume.iops,
+                    'SnapshotId': volume.snapshot,
+                    'VolumeSize': volume.volume_size,
+                    'VolumeType': volume.volume_type or volume.device_type
+                }
+            } for volume in volumes
+        ],
+        'EbsOptimized': ebs_optimized,
+        'ImageId': image,
+        'IamInstanceProfile': {
+            'Name': instance_profile_name
+        },
+        'InstanceType': instance_type,
+        'KernelId': kernel,
+        'KeyName': key_name,
+        'Monitoring': {
+            'Enabled': monitoring
+        },
+        'NetworkInterfaces': [
+            'AssociatePublicIpAddress': assign_public_ip,
+            'Groups': group_id,
+            'SubnetId': vpc_subnet_id
+        ]
+        'Placement': {
+            'AvailabilityZone': zone
+        },
+        'RamdiskId': ramdisk,
+        'UserData': user_data
+    }
+    if network_interfaces:
+        launchSpecification.NetworkInterfaces = [
+            {'NetworkInterfaceId': id} for id in network_interfaces
+        ]
+    try:
+        res = ec2.request_spot_instances(
+            BlockDurationMinutes=block_duration_minutes,
+            InstanceInterruptionBehavior=instance_initiated_shutdown_behavior,
+            LaunchGroup=spot_launch_group,
+            SpotPrice=spot_price,
+            Type=spot_type,
+            ValidUntil=utc_valid_until,
+            LaunchSpecification=launchSpecification
+        )
+    except ClientError, e:
+        module.fail_json(
+            msg="Instance creation failed => %s: %s"
+                % (e.error_code, e.error_message)
+        )
+
+    # wait here until the request is fulfilled
+    num_running = 0
+    wait_timeout = time.time() + wait_timeout
+    res_list = ()
+    while wait_timeout > time.time() and num_running < len(instids):
+        rs = ec2.describe_spot_instance_requests(instids)
+        numFulfilled = len([
+            1 for r in rs['SpotInstanceRequests'] if r['State'] == 'fulfilled'
+        ])
+        if numFulfilled == count:
+            break
+        else:
+            time.sleep(1)
+
+    if wait and wait_timeout <= time.time():
+        module.fail_json(
+            msg="wait for instances running timeout on %s" % time.asctime()
+        )
+
+    # We do this after the loop ends so that we end up with one list
+    for res in res_list:
+        running_instances.extend(res.instances)
+
+    # Enabled by default by AWS
+    if source_dest_check is False:
+        for inst in res.instances:
+            inst.modify_attribute('sourceDestCheck', False)
+
+    # Disabled by default by AWS
+    if termination_protection is True:
+        for inst in res.instances:
+            inst.modify_attribute('disableApiTermination', True)
+
+    # Leave this as late as possible to try 
+    # and avoid InvalidInstanceID.NotFound
+    if instance_tags and instids:
         try:
-            params = {'image_id': image,
-                      'key_name': key_name,
-                      'monitoring_enabled': monitoring,
-                      'placement': zone,
-                      'instance_type': instance_type,
-                      'kernel_id': kernel,
-                      'ramdisk_id': ramdisk}
-            if user_data is not None:
-                params['user_data'] = to_bytes(user_data, errors='surrogate_or_strict')
-
-            if ebs_optimized:
-                params['ebs_optimized'] = ebs_optimized
-
-            # 'tenancy' always has a default value, but it is not a valid parameter for spot instance request
-            if not spot_price:
-                params['tenancy'] = tenancy
-
-            if boto_supports_profile_name_arg(ec2):
-                params['instance_profile_name'] = instance_profile_name
-            else:
-                if instance_profile_name is not None:
-                    module.fail_json(
-                        msg="instance_profile_name parameter requires Boto version 2.5.0 or higher")
-
-            if assign_public_ip is not None:
-                if not boto_supports_associate_public_ip_address(ec2):
-                    module.fail_json(
-                        msg="assign_public_ip parameter requires Boto version 2.13.0 or higher.")
-                elif not vpc_subnet_id:
-                    module.fail_json(
-                        msg="assign_public_ip only available with vpc_subnet_id")
-
-                else:
-                    if private_ip:
-                        interface = boto.ec2.networkinterface.NetworkInterfaceSpecification(
-                            subnet_id=vpc_subnet_id,
-                            private_ip_address=private_ip,
-                            groups=group_id,
-                            associate_public_ip_address=assign_public_ip)
-                    else:
-                        interface = boto.ec2.networkinterface.NetworkInterfaceSpecification(
-                            subnet_id=vpc_subnet_id,
-                            groups=group_id,
-                            associate_public_ip_address=assign_public_ip)
-                    interfaces = boto.ec2.networkinterface.NetworkInterfaceCollection(interface)
-                    params['network_interfaces'] = interfaces
-            else:
-                if network_interfaces:
-                    if isinstance(network_interfaces, string_types):
-                        network_interfaces = [network_interfaces]
-                    interfaces = []
-                    for i, network_interface_id in enumerate(network_interfaces):
-                        interface = boto.ec2.networkinterface.NetworkInterfaceSpecification(
-                            network_interface_id=network_interface_id,
-                            device_index=i)
-                        interfaces.append(interface)
-                    params['network_interfaces'] = \
-                        boto.ec2.networkinterface.NetworkInterfaceCollection(*interfaces)
-                else:
-                    params['subnet_id'] = vpc_subnet_id
-                    if vpc_subnet_id:
-                        params['security_group_ids'] = group_id
-                    else:
-                        params['security_groups'] = group_name
-
-            if volumes:
-                bdm = BlockDeviceMapping()
-                for volume in volumes:
-                    if 'device_name' not in volume:
-                        module.fail_json(msg='Device name must be set for volume')
-                    # Minimum volume size is 1GiB. We'll use volume size explicitly set to 0
-                    # to be a signal not to create this volume
-                    if 'volume_size' not in volume or int(volume['volume_size']) > 0:
-                        bdm[volume['device_name']] = create_block_device(module, ec2, volume)
-
-                params['block_device_map'] = bdm
-
-            # check to see if we're using spot pricing first before starting instances
-            if not spot_price:
-                if assign_public_ip is not None and private_ip:
-                    params.update(
-                        dict(
-                            min_count=count_remaining,
-                            max_count=count_remaining,
-                            client_token=id,
-                            placement_group=placement_group,
-                        )
-                    )
-                else:
-                    params.update(
-                        dict(
-                            min_count=count_remaining,
-                            max_count=count_remaining,
-                            client_token=id,
-                            placement_group=placement_group,
-                            private_ip_address=private_ip,
-                        )
-                    )
-
-                # For ordinary (not spot) instances, we can select 'stop'
-                # (the default) or 'terminate' here.
-                params['instance_initiated_shutdown_behavior'] = instance_initiated_shutdown_behavior or 'stop'
-
-                try:
-                    res = ec2.run_instances(**params)
-                except boto.exception.EC2ResponseError as e:
-                    if (params['instance_initiated_shutdown_behavior'] != 'terminate' and
-                            "InvalidParameterCombination" == e.error_code):
-                        params['instance_initiated_shutdown_behavior'] = 'terminate'
-                        res = ec2.run_instances(**params)
-                    else:
-                        raise
-
-                instids = [i.id for i in res.instances]
-                while True:
-                    try:
-                        ec2.get_all_instances(instids)
-                        break
-                    except boto.exception.EC2ResponseError as e:
-                        if "<Code>InvalidInstanceID.NotFound</Code>" in str(e):
-                            # there's a race between start and get an instance
-                            continue
-                        else:
-                            module.fail_json(msg=str(e))
-
-                # The instances returned through ec2.run_instances above can be in
-                # terminated state due to idempotency. See commit 7f11c3d for a complete
-                # explanation.
-                terminated_instances = [
-                    str(instance.id) for instance in res.instances if instance.state == 'terminated'
-                ]
-                if terminated_instances:
-                    module.fail_json(msg="Instances with id(s) %s " % terminated_instances +
-                                     "were created previously but have since been terminated - " +
-                                     "use a (possibly different) 'instanceid' parameter")
-
-            # A spot request
-            else:
-                if private_ip:
-                    module.fail_json(
-                        msg='private_ip only available with on-demand (non-spot) instances')
-                # Set spot ValidUntil
-                # ValidUntil -> (timestamp). The end date of the request, in
-                # UTC format (for example, YYYY -MM -DD T*HH* :MM :SS Z).
-                utc_valid_until = (
-                    datetime.datetime.utcnow()
-                    + datetime.timedelta(seconds=spot_wait_timeout))
-
-                try:
-                    res = ec2.request_spot_instances(
-                        BlockDurationMinutes=block_duration_minutes,
-                        InstanceInterruptionBehavior=instance_initiated_shutdown_behavior,
-                        LaunchGroup=spot_launch_group,
-                        SpotPrice=spot_price,
-                        Type=spot_type,
-                        ValidUntil=utc_valid_until
-                    )
-                except ClientError, e:
-                    module.fail_json(msg="Instance creation failed => %s: %s" % (e.error_code, e.error_message))
-
-                # wait here until the request is fulfilled
-                num_running = 0
-                wait_timeout = time.time() + wait_timeout
-                res_list = ()
-                while wait_timeout > time.time() and num_running < len(instids):
-                    res_list = ec2.describe_spot_instance_requests(instids)
-                    if len([1 for req in res_list.SpotInstanceRequests  if req.State == 'fulfilled']) == count:
-                        break
-                    time.sleep(1)
-
-                if wait and wait_timeout <= time.time():
-                    module.fail_json(msg="wait for instances running timeout on %s" % time.asctime())
-
-        # We do this after the loop ends so that we end up with one list
-        for res in res_list:
-            running_instances.extend(res.instances)
-
-        # Enabled by default by AWS
-        if source_dest_check is False:
-            for inst in res.instances:
-                inst.modify_attribute('sourceDestCheck', False)
-
-        # Disabled by default by AWS
-        if termination_protection is True:
-            for inst in res.instances:
-                inst.modify_attribute('disableApiTermination', True)
-
-        # Leave this as late as possible to try and avoid InvalidInstanceID.NotFound
-        if instance_tags and instids:
-            try:
-                ec2.create_tags(instids, instance_tags)
-            except boto.exception.EC2ResponseError as e:
-                module.fail_json(msg="Instance tagging failed => %s: %s" % (e.error_code, e.error_message))
+            ec2.create_tags(instids, instance_tags)
+        except boto.exception.EC2ResponseError as e:
+            module.fail_json(msg="Instance tagging failed => %s: %s" % (e.error_code, e.error_message))
     instance_dict_array = []
     created_instance_ids = []
     for inst in running_instances:
@@ -1269,7 +1225,7 @@ def create_instances_boto3(module, ec2, vpc, override_count=None):
         created_instance_ids.append(inst.id)
         instance_dict_array.append(d)
 
-    return (instance_dict_array, created_instance_ids, changed)
+    return (instance_dict_array, created_instance_ids, True)
 
 
 def create_instances(module, ec2, vpc, override_count=None):
@@ -1316,11 +1272,17 @@ def create_instances(module, ec2, vpc, override_count=None):
     exact_count = module.params.get('exact_count')
     count_tag = module.params.get('count_tag')
     source_dest_check = module.boolean(module.params.get('source_dest_check'))
-    termination_protection = module.boolean(module.params.get('termination_protection'))
+    termination_protection = module.boolean(module.params.get(
+        'termination_protection'
+    ))
     network_interfaces = module.params.get('network_interfaces')
     spot_launch_group = module.params.get('spot_launch_group')
-    instance_initiated_shutdown_behavior = module.params.get('instance_initiated_shutdown_behavior')
-    block_duration_minutes = int(module.params.get('block_duration_minutes'))
+    instance_initiated_shutdown_behavior = module.params.get(
+        'instance_initiated_shutdown_behavior'
+    )
+    block_duration_minutes = module.params.get('block_duration_minutes')
+    if block_duration_minutes:
+        module.fail_json(msg='block_duration_minutes requires Boto3')
 
     vpc_id = None
     if vpc_subnet_id:
@@ -1931,6 +1893,7 @@ def main():
             spot_price=dict(),
             spot_type=dict(default='one-time', choices=["one-time", "persistent"]),
             spot_launch_group=dict(),
+            block_duration_minutes=dict(type='int'),
             image=dict(),
             kernel=dict(),
             count=dict(type='int', default='1'),
@@ -2031,7 +1994,7 @@ def main():
             module.fail_json(msg='image parameter is required for new instance')
 
         if module.params.get('exact_count') is None:
-            if HAS_BOTO3:
+            if HAS_BOTO3 and isinstance(modules.params.get('block_duration_minutes'), int):
                 (instance_dict_array, new_instance_ids, changed) = create_instances_boto3(module, ec2_boto3, vpc)
             else:
                 (instance_dict_array, new_instance_ids, changed) = create_instances(module, ec2, vpc)
